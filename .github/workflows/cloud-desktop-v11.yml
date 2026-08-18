@@ -73,8 +73,6 @@ jobs:
           RESOLUTION: ${{ github.event.inputs.resolution || '1024x768' }}
         run: |
           set -e
-          export USER=root
-          export HOME=/root
 
           vncserver -kill :1 2>/dev/null; true
           pkill -f vncserver 2>/dev/null; true
@@ -289,7 +287,6 @@ jobs:
 
             if [ "$VNC_UP" = "DOWN" ]; then
               echo "  [!] VNC down. Restarting..."
-              export USER=root HOME=/root
               vncserver :1 -AlwaysShared -CompressLevel 6 -JPEGQuality 6 2>&1 | tail -5
               sleep 3
             fi
