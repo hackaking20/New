@@ -1,0 +1,467 @@
+# Cloud Desktop via GitHub Actions v11
+# TigerVNC + tigervnc-tools + JPEG compression + fixed config syntax + openssl fallback
+#
+# FIXES in v11 (vs v10):
+# - Added tigervnc-tools package (provides tigervncpasswd)
+# - Config file uses key=value format (NO dashes)
+# - Only basic options in config (geometry, depth, rfbport) — no pixelformat (causes 'Invalid pixelformat' error)
+# - Compression options passed as CLI args to vncserver
+# - OpenSSL fallback for password creation if tigervncpasswd unavailable
+
+name: Cloud Desktop
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: 'How many hours to run (max 5.5)'
+        required: false
+        default: '5'
+        type: string
+      resolution:
+        description: 'Desktop resolution (1024x768 for speed, 1280x720 for quality)'
+        required: false
+        default: '1024x768'
+        type: string
+      auto_restart:
+        description: 'Auto-restart after 30 min rest? (true/false)'
+        required: false
+        default: 'true'
+        type: string
+
+jobs:
+  desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install XFCE + TigerVNC + tools + Firefox + noVNC
+        run: |
+          echo "::group::Installing packages"
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -qq
+
+          # TigerVNC + tigervnc-tools (provides tigervncpasswd!) + desktop + noVNC + fonts
+          sudo apt-get install -y -qq \
+            xfce4 xfce4-goodies \
+            tigervnc-standalone-server tigervnc-common tigervnc-tools \
+            novnc websockify \
+            dbus-x11 x11-utils \
+            xfonts-base xfonts-100dpi xfonts-75dpi \
+            jq curl wget openssl
+
+          echo "::endgroup::"
+
+          # Firefox from Mozilla PPA (avoid broken snap)
+          echo "Installing Firefox from Mozilla PPA..."
+          sudo install -d -m 0755 /etc/apt/keyrings
+          wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg -O /tmp/mozilla-key.gpg
+          sudo mv /tmp/mozilla-key.gpg /etc/apt/keyrings/packages.mozilla.org.asc
+          echo 'deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main' | sudo tee /etc/apt/sources.list.d/mozilla.list > /dev/null
+          sudo apt-get update -qq 2>&1 | tail -3
+          sudo apt-get install -y -qq firefox 2>&1 | tail -5
+
+          # Fallback: chromium
+          if ! which firefox >/dev/null 2>&1; then
+            echo "Firefox PPA failed, trying chromium..."
+            sudo apt-get install -y -qq chromium-browser 2>&1 | tail -3 || sudo apt-get install -y -qq chromium 2>&1 | tail -3
+          fi
+
+          echo ""
+          echo "Verifying installations..."
+          for tool in xfce4-session vncserver tigervncpasswd websockify firefox; do
+            if which $tool >/dev/null 2>&1; then
+              echo "  OK: $tool -> $(which $tool)"
+            else
+              echo "  MISSING: $tool"
+            fi
+          done
+
+          if ls /usr/share/fonts/X11/misc/ >/dev/null 2>&1; then
+            echo "  OK: xfonts-base installed"
+          else
+            echo "  MISSING: xfonts-base - installing..."
+            sudo apt-get install -y -qq xfonts-base
+          fi
+
+      - name: Start TigerVNC server
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD || 'password' }}
+          RESOLUTION: ${{ github.event.inputs.resolution || '1024x768' }}
+        run: |
+          export USER=root
+          export HOME=/root
+
+          # Kill any existing VNC
+          vncserver -kill :1 2>/dev/null; true
+          pkill -f vncserver 2>/dev/null; true
+          sleep 2
+
+          # Set VNC password using tigervncpasswd
+          # Fallback: openssl DES encryption with fixed VNC key if tigervncpasswd unavailable
+          mkdir -p ~/.vnc
+
+          if which tigervncpasswd >/dev/null 2>&1; then
+            echo "${VNC_PASSWORD}" | tigervncpasswd -f > ~/.vnc/passwd
+            echo "Password created with tigervncpasswd"
+          elif which vncpasswd >/dev/null 2>&1; then
+            echo "${VNC_PASSWORD}" | vncpasswd -f > ~/.vnc/passwd
+            echo "Password created with vncpasswd"
+          else
+            echo "tigervncpasswd not found, using openssl fallback..."
+            # VNC DES key (bit-reversed fixed key)
+            printf '%s' "${VNC_PASSWORD}" | head -c 8 | xargs -I{} printf '%-8s' {} | \
+              openssl enc -des-ecb -e -K "c441d660ac721ae0" -nopad > ~/.vnc/passwd
+            echo "Password created with openssl fallback"
+          fi
+          chmod 600 ~/.vnc/passwd
+
+          # Verify password file
+          if [ ! -s ~/.vnc/passwd ]; then
+            echo "::error::Password file is empty or missing!"
+            exit 1
+          fi
+          echo "Password file OK ($(stat -c%s ~/.vnc/passwd) bytes)"
+
+          # Write VNC config (key=value format, NO dashes!)
+          # Only basic options - compression passed as CLI args
+          cat > ~/.vnc/config << 'VNCCONFIG'
+desktop=cloud-desktop
+geometry=1024x768
+depth=16
+rfbport=5901
+VNCCONFIG
+
+          # Override geometry from input
+          sed -i "s/geometry=.*/geometry=${RESOLUTION}/" ~/.vnc/config
+
+          echo "Config file contents:"
+          cat ~/.vnc/config
+
+          # Write xstartup
+          cat > ~/.vnc/xstartup << 'XSTARTUP'
+#!/bin/bash
+unset SESSION_MANAGER
+unset DBUS_SESSION_BUS_ADDRESS
+export XKL_XMODMAP_DISABLE=1
+export XDG_CURRENT_DESKTOP="XFCE"
+export XDG_SESSION_DESKTOP="XFCE"
+export XDG_SESSION_TYPE="x11"
+export XDG_CONFIG_DIRS="/etc/xdg/xdg-xfce4:/etc/xdg"
+export XDG_DATA_DIRS="/usr/share/xfce4:/usr/share/xubuntu:/usr/local/share:/usr/share:/var/lib/snapd/desktop"
+if command -v dbus-launch >/dev/null 2>&1; then
+  eval $(dbus-launch --sh-syntax)
+fi
+exec startxfce4
+XSTARTUP
+          chmod +x ~/.vnc/xstartup
+
+          # Start TigerVNC with compression options as CLI args
+          echo "Starting TigerVNC server on display :1 (port 5901)..."
+          echo "Resolution: ${RESOLUTION}, Depth: 16, JPEG quality: 6"
+          vncserver :1 -AlwaysShared -CompressLevel 6 -JPEGQuality 6
+
+          sleep 3
+
+          # Verify VNC is running and listening
+          if ps aux | grep [v]nc >/dev/null && ss -tlnp | grep 5901 >/dev/null 2>&1; then
+            echo "TigerVNC server running on :1 (port 5901)"
+            vncserver --version 2>&1 | head -1
+          else
+            echo "::error::TigerVNC failed to start"
+            echo "VNC log:"
+            cat ~/.vnc/*:1.log 2>/dev/null | tail -20
+            echo "Config:"
+            cat ~/.vnc/config
+            echo "tigervncpasswd check:"
+            which tigervncpasswd || echo "tigervncpasswd NOT FOUND"
+            echo "passwd file:"
+            ls -la ~/.vnc/passwd
+            exit 1
+          fi
+
+      - name: Start websockify
+        run: |
+          NOVNC_DIR=""
+          for d in /usr/share/novnc /usr/share/webapps/novnc /var/www/novnc; do
+            if [ -d "$d" ]; then
+              NOVNC_DIR="$d"
+              break
+            fi
+          done
+
+          if [ -n "$NOVNC_DIR" ]; then
+            websockify --web="$NOVNC_DIR" 0.0.0.0:6080 localhost:5901 -D
+          else
+            websockify 0.0.0.0:6080 localhost:5901 -D
+          fi
+
+          sleep 2
+
+          if ps aux | grep websockify | grep -v grep >/dev/null; then
+            echo "websockify running on port 6080"
+          else
+            echo "::error::websockify failed to start"
+            exit 1
+          fi
+
+      - name: Download cloudflared
+        run: |
+          echo "Downloading cloudflared..."
+          wget -q -O /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /tmp/cloudflared
+          /tmp/cloudflared --version
+
+      - name: Start tunnel + notify ntfy
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC || 'JAI_HO' }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD || 'password' }}
+        run: |
+          echo "Starting TryCloudflare quick tunnel..."
+          /tmp/cloudflared tunnel --url http://localhost:6080 > /tmp/cloudflared.log 2>&1 &
+
+          echo "Waiting for public URL... (10-30 seconds)"
+
+          DESKTOP_URL=""
+          for i in $(seq 1 30); do
+            sleep 2
+            DESKTOP_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log 2>/dev/null | head -1)
+            if [ -n "$DESKTOP_URL" ]; then
+              break
+            fi
+            echo "  ...waiting ($i/30)"
+          done
+
+          FULL_URL="${DESKTOP_URL}/vnc.html"
+
+          HOSTNAME=$(hostname)
+          OS_INFO=$(uname -a)
+          CPU_INFO=$(lscpu | grep -E "Model name|CPU\(s\):" | head -2 | tr '\n' ' ')
+          RAM_INFO=$(free -h | grep Mem)
+          DISK_INFO=$(df -h / | tail -1)
+          PUBLIC_IP=$(curl -s ifconfig.me 2>/dev/null || echo "unknown")
+          VNC_VERSION=$(vncserver --version 2>&1 | head -1)
+
+          echo "============================================================"
+          echo "  SUCCESS! Cloud desktop is live!"
+          echo "============================================================"
+          echo "  Desktop URL:  $FULL_URL"
+          echo "  VNC Password: $VNC_PASSWORD"
+          echo "  VNC Server:    $VNC_VERSION"
+          echo "  Hostname:      $HOSTNAME"
+          echo "  RAM:            $RAM_INFO"
+          echo "============================================================"
+
+          if [ -z "$DESKTOP_URL" ]; then
+            echo "ERROR: Could not get TryCloudflare URL"
+            cat /tmp/cloudflared.log | tail -20
+            curl -s -H "Title: Tunnel Error" \
+                 -H "Priority: 5" -H "Tags: x,warning" \
+                 -d "Tunnel FAILED to start. Hostname: $HOSTNAME RAM: $RAM_INFO" \
+                 "https://ntfy.sh/${NTFY_TOPIC}"
+            exit 1
+          fi
+
+          # Send ONE combined notification
+          FULL_MESSAGE="CLOUD DESKTOP IS LIVE!
+========================
+
+>>> DESKTOP URL <<<
+$FULL_URL
+
+>>> VNC PASSWORD <<<
+$VNC_PASSWORD
+
+--- SYSTEM INFO ---
+Platform: GitHub Actions (ubuntu-latest)
+Hostname: $HOSTNAME
+OS: $OS_INFO
+CPU: $CPU_INFO
+RAM: $RAM_INFO
+Disk: $DISK_INFO
+Public IP: $PUBLIC_IP
+VNC Server: $VNC_VERSION
+
+--- PERFORMANCE ---
+Resolution: ${{ github.event.inputs.resolution || '1024x768' }}
+Color depth: 16-bit (RGB565)
+Encoding: JPEG compression level 6, quality 6
+Ping interval: 2 min
+
+--- HOW TO CONNECT ---
+1. Open the URL above in your phone browser
+2. Click Connect on the noVNC page
+3. Enter the VNC password: $VNC_PASSWORD
+
+--- NOTES ---
+- URL changes every run
+- Desktop runs for ~5 hours then auto-restarts
+- Check ntfy.sh/${NTFY_TOPIC} in browser if app not installed"
+
+          echo "Sending combined notification to ntfy.sh/${NTFY_TOPIC}..."
+          curl -s -X POST \
+               -H "Title: Cloud Desktop is LIVE!" \
+               -H "Priority: 5" \
+               -H "Tags: tada,rocket,computer,lock" \
+               -H "Click: ${FULL_URL}" \
+               -d "$FULL_MESSAGE" \
+               "https://ntfy.sh/${NTFY_TOPIC}"
+          echo ""
+          echo "Notification sent! Desktop URL: $FULL_URL"
+
+      - name: Keep alive + ping tunnel
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC || 'JAI_HO' }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD || 'password' }}
+          RUN_HOURS: ${{ github.event.inputs.hours || '5' }}
+        run: |
+          HOURS=$(echo "${RUN_HOURS}" | bc -l 2>/dev/null || echo "5")
+          SECONDS_TO_RUN=$(echo "$HOURS * 3600" | bc -l 2>/dev/null || echo "18000")
+          if [ "$SECONDS_TO_RUN" -gt 19800 ] 2>/dev/null; then
+            SECONDS_TO_RUN=19800
+          fi
+          echo "Desktop will run for $(echo "scale=1; $SECONDS_TO_RUN / 3600" | bc) hours"
+
+          DESKTOP_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log 2>/dev/null | head -1)
+          PING_URL="${DESKTOP_URL}/vnc.html"
+
+          ELAPSED=0
+          INTERVAL=120
+          PING_COUNT=0
+
+          while [ $ELAPSED -lt $SECONDS_TO_RUN ]; do
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+            PING_COUNT=$((PING_COUNT + 1))
+
+            PING_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$PING_URL" 2>/dev/null || echo "000")
+
+            CF_UP="UP"; VNC_UP="UP"; WS_UP="UP"
+            ps aux | grep cloudflared | grep -v grep >/dev/null || CF_UP="DOWN"
+            ps aux | grep [v]nc >/dev/null || VNC_UP="DOWN"
+            ps aux | grep websockify | grep -v grep >/dev/null || WS_UP="DOWN"
+
+            REMAINING=$((SECONDS_TO_RUN - ELAPSED))
+            echo "[$(date +%H:%M:%S)] Ping #${PING_COUNT} | URL: ${PING_STATUS} | CF: ${CF_UP} | VNC: ${VNC_UP} | WS: ${WS_UP} | ${REMAINING}s left"
+
+            if [ "$CF_UP" = "DOWN" ] || [ "$PING_STATUS" = "000" ] || [ "$PING_STATUS" = "502" ]; then
+              echo "  [!] Tunnel down or unreachable. Restarting..."
+              pkill -f cloudflared 2>/dev/null; sleep 2
+              /tmp/cloudflared tunnel --url http://localhost:6080 > /tmp/cloudflared.log 2>&1 &
+              sleep 15
+              NEW_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log 2>/dev/null | head -1)
+              if [ -n "$NEW_URL" ]; then
+                PING_URL="${NEW_URL}/vnc.html"
+                echo "  [+] Tunnel restarted! New URL: $PING_URL"
+                curl -s -X POST -H "Title: Tunnel Restarted" -H "Priority: 4" -H "Tags: warning,refresh" -H "Click: ${PING_URL}" \
+                     -d "Tunnel restarted (auto). New URL: ${PING_URL} Password unchanged: ${VNC_PASSWORD} Ping #${PING_COUNT}" \
+                     "https://ntfy.sh/${NTFY_TOPIC}"
+              else
+                echo "  [!] Tunnel restart failed!"
+              fi
+            fi
+
+            if [ "$VNC_UP" = "DOWN" ]; then
+              echo "  [!] VNC down. Restarting..."
+              export USER=root HOME=/root
+              vncserver :1 -AlwaysShared -CompressLevel 6 -JPEGQuality 6 2>&1 | tail -5
+              sleep 3
+            fi
+
+            if [ "$WS_UP" = "DOWN" ]; then
+              echo "  [!] websockify down. Restarting..."
+              NOVNC_DIR=""
+              for d in /usr/share/novnc /usr/share/webapps/novnc /var/www/novnc; do
+                [ -d "$d" ] && NOVNC_DIR="$d" && break
+              done
+              if [ -n "$NOVNC_DIR" ]; then
+                websockify --web="$NOVNC_DIR" 0.0.0.0:6080 localhost:5901 -D
+              else
+                websockify 0.0.0.0:6080 localhost:5901 -D
+              fi
+              sleep 2
+            fi
+
+            if [ $((PING_COUNT % 10)) -eq 0 ]; then
+              echo "  --- Summary: ${PING_COUNT} pings, uptime: $((PING_COUNT * INTERVAL / 60)) min ---"
+            fi
+          done
+
+          echo "Time limit reached. Shutting down."
+          curl -s -X POST -H "Title: Desktop Shutting Down" -H "Priority: 4" -H "Tags: wave,computer" \
+               -d "Cloud desktop session ended. Auto-restart in 30 minutes if enabled." \
+               "https://ntfy.sh/${NTFY_TOPIC}"
+
+      - name: Rest and trigger next run
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC || 'JAI_HO' }}
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          AUTO_RESTART: ${{ github.event.inputs.auto_restart || 'true' }}
+          GITHUB_REPO: ${{ github.repository }}
+        run: |
+          AUTO_RESTART=$(echo "$AUTO_RESTART" | tr '[:upper:]' '[:lower:]')
+
+          if [ "$AUTO_RESTART" != "true" ]; then
+            echo "Auto-restart disabled."
+            curl -s -X POST -H "Title: Desktop Stopped" -H "Priority: 3" -H "Tags: wave" \
+                 -d "Desktop stopped. Auto-restart was disabled." "https://ntfy.sh/${NTFY_TOPIC}"
+            exit 0
+          fi
+
+          if [ -z "$PAT_TOKEN" ]; then
+            echo "ERROR: PAT_TOKEN secret is not set!"
+            curl -s -X POST -H "Title: Auto-restart Failed" -H "Priority: 5" -H "Tags: x,warning" \
+                 -d "Cannot auto-restart: PAT_TOKEN secret is not set. Add it in repo Settings -> Secrets -> Actions." \
+                 "https://ntfy.sh/${NTFY_TOPIC}"
+            exit 1
+          fi
+
+          echo "Rest period: 30 minutes, then auto-trigger next run"
+          curl -s -X POST -H "Title: Rest Period Started" -H "Priority: 3" -H "Tags: coffee,sleep" \
+               -d "Desktop session ended. Resting 30 min. New desktop starts automatically." \
+               "https://ntfy.sh/${NTFY_TOPIC}"
+
+          sleep 1800
+
+          echo "Triggering new workflow run..."
+          API_URL="https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/cloud-desktop.yml/dispatches"
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+               -H "Accept: application/vnd.github+json" \
+               -H "Authorization: Bearer ${PAT_TOKEN}" \
+               -H "X-GitHub-Api-Version: 2022-11-28" \
+               -d '{"ref":"refs/heads/main","inputs":{"hours":"5","auto_restart":"true"}}' \
+               "$API_URL")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          echo "API response: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" = "204" ]; then
+            echo "SUCCESS: New workflow run triggered!"
+            curl -s -X POST -H "Title: New Desktop Starting" -H "Priority: 4" -H "Tags: rocket,refresh" \
+                 -d "New desktop workflow triggered! Setup takes ~5 min. New URL notification coming soon." \
+                 "https://ntfy.sh/${NTFY_TOPIC}"
+          else
+            echo "Trying master branch..."
+            RESPONSE2=$(curl -s -w "\n%{http_code}" -X POST \
+                 -H "Accept: application/vnd.github+json" \
+                 -H "Authorization: Bearer ${PAT_TOKEN}" \
+                 -H "X-GitHub-Api-Version: 2022-11-28" \
+                 -d '{"ref":"refs/heads/master","inputs":{"hours":"5","auto_restart":"true"}}' \
+                 "$API_URL")
+            HTTP_CODE2=$(echo "$RESPONSE2" | tail -1)
+            if [ "$HTTP_CODE2" = "204" ]; then
+              echo "SUCCESS with master branch!"
+              curl -s -X POST -H "Title: New Desktop Starting" -H "Priority: 4" -H "Tags: rocket,refresh" \
+                   -d "New desktop workflow triggered! Setup takes ~5 min." "https://ntfy.sh/${NTFY_TOPIC}"
+            else
+              curl -s -X POST -H "Title: Auto-restart Failed" -H "Priority: 5" -H "Tags: x,warning" \
+                   -d "Failed to trigger new run. HTTP $HTTP_CODE. Manually run from GitHub Actions tab." \
+                   "https://ntfy.sh/${NTFY_TOPIC}"
+              exit 1
+            fi
+          fi
