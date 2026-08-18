@@ -1,6 +1,5 @@
 # Cloud Desktop via GitHub Actions v11
 # TigerVNC + tigervnc-tools + JPEG compression + fixed config + openssl fallback
-# All heredocs replaced with echo/printf to avoid YAML parsing issues
 
 name: Cloud Desktop
 
@@ -71,32 +70,37 @@ jobs:
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD || 'password' }}
           RESOLUTION: ${{ github.event.inputs.resolution || '1024x768' }}
-        shell: bash
+        shell: bash {0}
         run: |
-          vncserver -kill :1 2>/dev/null; true
-          pkill -f vncserver 2>/dev/null; true
-          sleep 2
-
-          mkdir -p ~/.vnc
-
-          echo "=== HOME and USER ==="
+          set +e
+          echo "=== START ==="
           echo "HOME=$HOME"
           echo "USER=$(whoami)"
           echo "HOME exists: $([ -d "$HOME" ] && echo yes || echo no)"
           echo "HOME writable: $([ -w "$HOME" ] && echo yes || echo no)"
+          echo "PWD=$(pwd)"
+          echo "VNC_PASSWORD length: ${#VNC_PASSWORD}"
+          echo "RESOLUTION: $RESOLUTION"
+
+          vncserver -kill :1 2>/dev/null
+          pkill -f vncserver 2>/dev/null
+          sleep 2
+
+          mkdir -p ~/.vnc
+          echo "Created ~/.vnc directory"
 
           echo "=== Setting VNC password ==="
           if which tigervncpasswd >/dev/null 2>&1; then
             echo "${VNC_PASSWORD}" | tigervncpasswd -f > ~/.vnc/passwd
-            echo "Password created with tigervncpasswd"
+            echo "Password created with tigervncpasswd (rc=$?)"
           elif which vncpasswd >/dev/null 2>&1; then
             echo "${VNC_PASSWORD}" | vncpasswd -f > ~/.vnc/passwd
-            echo "Password created with vncpasswd"
+            echo "Password created with vncpasswd (rc=$?)"
           else
             echo "tigervncpasswd not found, using openssl fallback..."
             printf '%s' "${VNC_PASSWORD}" | head -c 8 | xargs -I{} printf '%-8s' {} | \
               openssl enc -des-ecb -e -K "c441d660ac721ae0" -nopad > ~/.vnc/passwd
-            echo "Password created with openssl fallback"
+            echo "Password created with openssl fallback (rc=$?)"
           fi
           chmod 600 ~/.vnc/passwd
 
@@ -133,9 +137,9 @@ jobs:
           chmod +x ~/.vnc/xstartup
 
           echo "=== Verifying prerequisites ==="
-          echo "tigervncpasswd: $(which tigervncpasswd 2>/dev/null || echo NOT FOUND)"
-          echo "vncserver: $(which vncserver 2>/dev/null || echo NOT FOUND)"
-          echo "Xvnc: $(which Xvnc 2>/dev/null || echo NOT FOUND)"
+          echo "tigervncpasswd: $(which tigervncpasswd 2>/dev/null || echo NOT_FOUND)"
+          echo "vncserver: $(which vncserver 2>/dev/null || echo NOT_FOUND)"
+          echo "Xvnc: $(which Xvnc 2>/dev/null || echo NOT_FOUND)"
           echo "Fonts: $(ls /usr/share/fonts/X11/misc/ 2>/dev/null | head -1 || echo NONE)"
           echo "passwd file: $(ls -la ~/.vnc/passwd 2>/dev/null || echo MISSING)"
           echo "xstartup file: $(ls -la ~/.vnc/xstartup 2>/dev/null || echo MISSING)"
@@ -146,12 +150,10 @@ jobs:
           echo "Resolution: ${RESOLUTION}"
           echo ""
 
-          set +e
           vncserver :1 -AlwaysShared -CompressLevel 6 -JPEGQuality 6 2>&1
           VNC_RC=$?
           echo ""
           echo "vncserver exit code: $VNC_RC"
-          set -e
 
           sleep 3
 
@@ -168,14 +170,12 @@ jobs:
             echo "::error::TigerVNC failed to start (exit code: $VNC_RC)"
             echo "=== VNC LOG (full) ==="
             cat ~/.vnc/*:1.log 2>/dev/null || echo "  No log file found"
-            echo "=== VNC LOG (check other locations) ==="
+            echo "=== ~/.vnc/ listing ==="
             ls -la ~/.vnc/ 2>/dev/null
             echo "=== /tmp/.X*-lock ==="
             ls -la /tmp/.X*-lock 2>/dev/null || echo "  No X lock files"
             echo "=== /tmp/.X11-unix ==="
             ls -la /tmp/.X11-unix/ 2>/dev/null || echo "  No X11-unix dir"
-            echo "=== dmesg (last 5) ==="
-            dmesg 2>/dev/null | tail -5 || echo "  dmesg not available"
             exit 1
           fi
 
