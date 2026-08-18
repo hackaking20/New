@@ -1,0 +1,97 @@
+name: WZML-X Bot Runner
+
+on:
+  schedule:
+    # Runs every 5 hours (5h run + 30min rest cycle handled inside)
+    - cron: '0 */5 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install pymongo requests
+
+      - name: Start Cloudflare Tunnel
+        env:
+          CLOUDFLARE_TOKEN: ${{ secrets.CLOUDFLARE_TOKEN }}
+        run: |
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+          cloudflared tunnel --url http://localhost:80 --token "$CLOUDFLARE_TOKEN" &
+          echo "Cloudflare tunnel started in background"
+          sleep 10
+
+      - name: Broadcast pre-shutdown warning (+5min before shutdown)
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+        run: |
+          python broadcast.py "⚠️ Bot will restart in 5 minutes for maintenance. Please save your progress."
+
+      - name: Run WZML-X Bot in Docker
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          docker run -d \
+            --name wzml-bot \
+            -e BOT_TOKEN="$BOT_TOKEN" \
+            -e DATABASE_URL="$DATABASE_URL" \
+            -e OWNER_ID="$OWNER_ID" \
+            -e API_ID="$API_ID" \
+            -e API_HASH="$API_HASH" \
+            -e PAT_TOKEN="$PAT_TOKEN" \
+            ghcr.io/wzmlx/wzmlx:latest
+
+          # Run the bot for 5 hours
+          BOT_RUN_SECONDS=$((5 * 60 * 60))
+          echo "Bot started, running for $BOT_RUN_SECONDS seconds (5h)"
+
+          # Watchdog: wait until 10 min before shutdown
+          WATCHDOG_SECONDS=$((BOT_RUN_SECONDS - 10 * 60))
+          sleep $WATCHDOG_SECONDS
+
+      - name: Broadcast final shutdown warning (-10min before shutdown)
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+        run: |
+          python broadcast.py "🔴 Bot is shutting down in 10 minutes for a scheduled restart. It will be back online shortly."
+
+      - name: Wait remaining 10 minutes then stop
+        run: |
+          sleep $((10 * 60))
+          docker stop wzml-bot || true
+          docker rm wzml-bot || true
+          echo "Bot stopped, entering 30 min rest period"
+
+      - name: Rest period and auto-restart via PAT
+        env:
+          GH_PAT: ${{ secrets.PAT_TOKEN }}
+        run: |
+          echo "Resting 30 minutes before auto-restart..."
+          sleep $((30 * 60))
+          echo "Triggering workflow re-run via PAT..."
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_PAT" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/wzml-bot.yml/dispatches \
+            -d '{"ref":"main"}' || echo "Auto-restart trigger may have failed; will rely on schedule."
