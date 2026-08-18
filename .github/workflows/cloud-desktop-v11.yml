@@ -1,6 +1,5 @@
 # Cloud Desktop via GitHub Actions v11
 # TigerVNC + tigervnc-tools + JPEG compression + fixed config + openssl fallback
-# All heredocs replaced with echo/printf to avoid YAML parsing issues
 
 name: Cloud Desktop
 
@@ -45,17 +44,32 @@ jobs:
             xfonts-base xfonts-100dpi xfonts-75dpi \
             jq curl wget openssl bc
 
-          echo "Installing Firefox from Mozilla PPA..."
+          echo "Purging snap-based firefox stub if present..."
+          sudo apt-get purge -y firefox snapd 2>/dev/null || true
+
+          echo "Installing Firefox from Mozilla PPA (.deb, not snap)..."
           sudo install -d -m 0755 /etc/apt/keyrings
           wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg -O /tmp/mozilla-key.gpg
           sudo mv /tmp/mozilla-key.gpg /etc/apt/keyrings/packages.mozilla.org.asc
           echo 'deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main' | sudo tee /etc/apt/sources.list.d/mozilla.list > /dev/null
+
+          # Pin Mozilla PPA above Ubuntu's snap redirect package
+          printf '%s\n' \
+            'Package: firefox*' \
+            'Pin: origin packages.mozilla.org' \
+            'Pin-Priority: 1001' | sudo tee /etc/apt/preferences.d/mozilla > /dev/null
+
           sudo apt-get update -qq 2>&1 | tail -3
           sudo apt-get install -y -qq firefox 2>&1 | tail -5
 
-          if ! which firefox >/dev/null 2>&1; then
-            echo "Firefox PPA failed, trying chromium..."
-            sudo apt-get install -y -qq chromium-browser 2>&1 | tail -3 || sudo apt-get install -y -qq chromium 2>&1 | tail -3
+          # Verify it's a real binary, not a snap redirect
+          if ! which firefox >/dev/null 2>&1 || readlink -f "$(which firefox)" 2>/dev/null | grep -q snap; then
+            echo "Firefox .deb failed or is snap, trying chromium..."
+            sudo apt-get install -y -qq chromium 2>&1 | tail -3 || true
+            if ! which chromium >/dev/null 2>&1; then
+              echo "chromium not available, installing chromium snap wrapper..."
+              sudo apt-get install -y -qq chromium-browser 2>&1 | tail -3 || true
+            fi
           fi
 
           echo "Verifying installations..."
@@ -73,40 +87,23 @@ jobs:
           RESOLUTION: ${{ github.event.inputs.resolution || '1024x768' }}
         run: |
           set -e
-
-          vncserver -kill :1 2>/dev/null; true
-          pkill -f vncserver 2>/dev/null; true
+          vncserver -kill :1 2>/dev/null || true
+          pkill -f vncserver 2>/dev/null || true
           sleep 2
 
           mkdir -p ~/.vnc
 
-          if which tigervncpasswd >/dev/null 2>&1; then
-            echo "${VNC_PASSWORD}" | tigervncpasswd -f > ~/.vnc/passwd
-            echo "Password created with tigervncpasswd"
-          elif which vncpasswd >/dev/null 2>&1; then
-            echo "${VNC_PASSWORD}" | vncpasswd -f > ~/.vnc/passwd
-            echo "Password created with vncpasswd"
-          else
-            echo "tigervncpasswd not found, using openssl fallback..."
-            printf '%s' "${VNC_PASSWORD}" | head -c 8 | xargs -I{} printf '%-8s' {} | \
-              openssl enc -des-ecb -e -K "c441d660ac721ae0" -nopad > ~/.vnc/passwd
-            echo "Password created with openssl fallback"
-          fi
+          echo "${VNC_PASSWORD}" | tigervncpasswd -f > ~/.vnc/passwd
           chmod 600 ~/.vnc/passwd
-
           if [ ! -s ~/.vnc/passwd ]; then
             echo "::error::Password file is empty or missing!"
             exit 1
           fi
-          echo "Password file OK ($(stat -c%s ~/.vnc/passwd) bytes)"
 
           echo 'desktop=cloud-desktop' > ~/.vnc/config
           echo 'geometry='"${RESOLUTION}" >> ~/.vnc/config
           echo 'depth=16' >> ~/.vnc/config
           echo 'rfbport=5901' >> ~/.vnc/config
-
-          echo "Config file contents:"
-          cat ~/.vnc/config
 
           printf '%s\n' \
             '#!/bin/bash' \
@@ -124,20 +121,15 @@ jobs:
             'exec startxfce4' > ~/.vnc/xstartup
           chmod +x ~/.vnc/xstartup
 
-          echo "Starting TigerVNC server on display :1 (port 5901)..."
-          vncserver :1 -AlwaysShared -CompressLevel 6 -JPEGQuality 6
-
+          vncserver :1 -AlwaysShared
           sleep 3
 
-          if ps aux | grep [v]nc >/dev/null && ss -tlnp | grep 5901 >/dev/null 2>&1; then
-            echo "TigerVNC server running on :1 (port 5901)"
-            vncserver --version 2>&1 | head -1
-          else
+          if ! ps aux | grep [v]nc >/dev/null || ! ss -tlnp 2>/dev/null | grep 5901 >/dev/null; then
             echo "::error::TigerVNC failed to start"
-            echo "VNC log:"
-            cat ~/.vnc/*:1.log 2>/dev/null | tail -20
+            cat ~/.vnc/*:1.log 2>/dev/null || true
             exit 1
           fi
+          echo "SUCCESS: TigerVNC server running on :1 (port 5901)"
 
       - name: Start websockify
         run: |
@@ -219,7 +211,7 @@ jobs:
             exit 1
           fi
 
-          printf 'CLOUD DESKTOP IS LIVE!\n========================\n\n>>> DESKTOP URL <<<\n%s\n\n>>> VNC PASSWORD <<<\n%s\n\n--- SYSTEM INFO ---\nPlatform: GitHub Actions (ubuntu-latest)\nHostname: %s\nOS: %s\nCPU: %s\nRAM: %s\nDisk: %s\nPublic IP: %s\nVNC Server: %s\n\n--- PERFORMANCE ---\nResolution: 1024x768\nColor depth: 16-bit (RGB565)\nEncoding: JPEG compression level 6, quality 6\nPing interval: 2 min\n\n--- HOW TO CONNECT ---\n1. Open the URL above in your phone browser\n2. Click Connect on the noVNC page\n3. Enter the VNC password: %s\n\n--- NOTES ---\n- URL changes every run\n- Desktop runs for ~5 hours then auto-restarts\n- Check ntfy.sh/%s in browser if app not installed\n' \
+          printf 'CLOUD DESKTOP IS LIVE!\n========================\n\n>>> DESKTOP URL <<<\n%s\n\n>>> VNC PASSWORD <<<\n%s\n\n--- SYSTEM INFO ---\nPlatform: GitHub Actions (ubuntu-latest)\nHostname: %s\nOS: %s\nCPU: %s\nRAM: %s\nDisk: %s\nPublic IP: %s\nVNC Server: %s\n\n--- PERFORMANCE ---\nResolution: 1024x768\nColor depth: 16-bit (RGB565)\nEncoding: Tight (TigerVNC built-in)\nPing interval: 2 min\n\n--- HOW TO CONNECT ---\n1. Open the URL above in your phone browser\n2. Click Connect on the noVNC page\n3. Enter the VNC password: %s\n\n--- NOTES ---\n- URL changes every run\n- Desktop runs for ~5 hours then auto-restarts\n- Check ntfy.sh/%s in browser if app not installed\n' \
             "$FULL_URL" "$VNC_PASSWORD" "$HOSTNAME" "$OS_INFO" "$CPU_INFO" "$RAM_INFO" "$DISK_INFO" "$PUBLIC_IP" "$VNC_VERSION" "$VNC_PASSWORD" "$NTFY_TOPIC" > /tmp/ntfy_message.txt
 
           echo "Sending combined notification to ntfy.sh/${NTFY_TOPIC}..."
@@ -287,7 +279,7 @@ jobs:
 
             if [ "$VNC_UP" = "DOWN" ]; then
               echo "  [!] VNC down. Restarting..."
-              vncserver :1 -AlwaysShared -CompressLevel 6 -JPEGQuality 6 2>&1 | tail -5
+              vncserver :1 -AlwaysShared 2>&1 | tail -5
               sleep 3
             fi
 
