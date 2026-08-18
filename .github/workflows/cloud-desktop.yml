@@ -44,17 +44,32 @@ jobs:
             xfonts-base xfonts-100dpi xfonts-75dpi \
             jq curl wget openssl bc
 
-          echo "Installing Firefox from Mozilla PPA..."
+          echo "Purging snap-based firefox stub if present..."
+          sudo apt-get purge -y firefox snapd 2>/dev/null || true
+
+          echo "Installing Firefox from Mozilla PPA (.deb, not snap)..."
           sudo install -d -m 0755 /etc/apt/keyrings
           wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg -O /tmp/mozilla-key.gpg
           sudo mv /tmp/mozilla-key.gpg /etc/apt/keyrings/packages.mozilla.org.asc
           echo 'deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main' | sudo tee /etc/apt/sources.list.d/mozilla.list > /dev/null
+
+          # Pin Mozilla PPA above Ubuntu's snap redirect package
+          printf '%s\n' \
+            'Package: firefox*' \
+            'Pin: origin packages.mozilla.org' \
+            'Pin-Priority: 1001' | sudo tee /etc/apt/preferences.d/mozilla > /dev/null
+
           sudo apt-get update -qq 2>&1 | tail -3
           sudo apt-get install -y -qq firefox 2>&1 | tail -5
 
-          if ! which firefox >/dev/null 2>&1; then
-            echo "Firefox PPA failed, trying chromium..."
-            sudo apt-get install -y -qq chromium-browser 2>&1 | tail -3 || sudo apt-get install -y -qq chromium 2>&1 | tail -3
+          # Verify it's a real binary, not a snap redirect
+          if ! which firefox >/dev/null 2>&1 || readlink -f "$(which firefox)" 2>/dev/null | grep -q snap; then
+            echo "Firefox .deb failed or is snap, trying chromium..."
+            sudo apt-get install -y -qq chromium 2>&1 | tail -3 || true
+            if ! which chromium >/dev/null 2>&1; then
+              echo "chromium not available, installing chromium snap wrapper..."
+              sudo apt-get install -y -qq chromium-browser 2>&1 | tail -3 || true
+            fi
           fi
 
           echo "Verifying installations..."
