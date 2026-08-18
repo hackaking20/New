@@ -1,135 +1,98 @@
 #!/usr/bin/env python3
+"""Broadcast a message to all bot users via Telegram API.
+
+Usage: python3 broadcast.py "Your message here"
+Reads BOT_TOKEN, DATABASE_URL, OWNER_ID from environment.
+Queries MongoDB for all PM users + registered users, then sends
+the message to each via the Telegram Bot API.
 """
-Broadcast script for the WZML-X Telegram bot.
-
-Reads BOT_TOKEN, DATABASE_URL, and OWNER_ID from the environment,
-queries MongoDB for all PM (private-message) users, and sends the
-provided message to each of them via the Telegram Bot API.
-
-Usage:
-    python broadcast.py "Your message text here"
-"""
-
-import os
 import sys
+import os
 import time
-import logging
-from urllib.parse import urlparse
+from hashlib import sha256
 
 import requests
-from pymongo import MongoClient
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-log = logging.getLogger("broadcast")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+OWNER_ID = os.environ.get("OWNER_ID", "0")
+MESSAGE = sys.argv[1] if len(sys.argv) > 1 else "Bot is live!"
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-OWNER_ID = os.environ.get("OWNER_ID", "").strip()
+if not BOT_TOKEN:
+    print("ERROR: BOT_TOKEN not set")
+    sys.exit(1)
 
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+bot_id = BOT_TOKEN.split(":")[0]
+salt = b"wzmlx_v3_db_partition_salt"
+partition = f"p_{sha256(salt + bot_id.encode()).hexdigest()[:24]}"
 
+uids = []
 
-def get_users():
-    """Connect to MongoDB and return the list of PM user chat IDs."""
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set")
+if DATABASE_URL:
+    try:
+        from pymongo import MongoClient
 
-    client = MongoClient(DATABASE_URL)
-    # Try common WZML-X collection names for PM users.
-    db_name = urlparse(DATABASE_URL).path.lstrip("/") or "WZML-X"
-    db = client[db_name]
+        client = MongoClient(DATABASE_URL, serverSelectionTimeoutMS=10000)
+        db = client.wzmlx
 
-    user_ids = []
-    # WZML-X typically stores PM users in the 'users' collection.
-    for collection_name in ("users", "pmusers", "main"):
+        # PM users (users who have started the bot)
+        pm_col = db[f"pm_users.{partition}"]
+        for doc in pm_col.find({}):
+            if doc.get("_id"):
+                uids.append(int(doc["_id"]))
+
+        # Registered users (users with stored settings)
         try:
-            col = db[collection_name]
-            for doc in col.find({}, {"_id": 1, "user_id": 1, "chat_id": 1, "id": 1}):
-                uid = doc.get("user_id") or doc.get("chat_id") or doc.get("id") or doc.get("_id")
-                if uid is not None:
-                    try:
-                        user_ids.append(int(uid))
-                    except (TypeError, ValueError):
-                        continue
-            if user_ids:
-                log.info("Loaded %d users from collection '%s'", len(user_ids), collection_name)
-                break
-        except Exception as e:
-            log.debug("Collection '%s' not usable: %s", collection_name, e)
+            reg_col = db[f"users.{partition}"]
+            for doc in reg_col.find({}):
+                if doc.get("_id") and int(doc["_id"]) not in uids:
+                    uids.append(int(doc["_id"]))
+        except Exception:
+            pass
 
-    client.close()
-    # De-duplicate while preserving order.
-    seen = set()
-    unique = []
-    for u in user_ids:
-        if u not in seen:
-            seen.add(u)
-            unique.append(u)
-    return unique
+        client.close()
+        print(f"Found {len(uids)} users in MongoDB (partition: {partition})")
+    except Exception as e:
+        print(f"MongoDB error: {e}")
 
+# Always include the owner
+try:
+    oid = int(OWNER_ID)
+    if oid and oid not in uids:
+        uids.insert(0, oid)
+except (ValueError, TypeError):
+    pass
 
-def send_message(chat_id, text):
-    """Send a single message via the Telegram Bot API."""
+if not uids:
+    print("No users found at all. Skipping broadcast.")
+    sys.exit(0)
+
+print(f"Broadcasting to {len(uids)} users...")
+api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+success, failed = 0, 0
+
+for uid in uids:
     try:
         resp = requests.post(
-            TELEGRAM_API,
+            api_url,
             json={
-                "chat_id": chat_id,
-                "text": text,
+                "chat_id": uid,
+                "text": MESSAGE,
                 "parse_mode": "HTML",
-                "disable_web_page_preview": True,
+                "disable_web_page_preview": False,
             },
             timeout=30,
         )
-        if resp.status_code != 200:
-            log.warning("Failed for %s: %s %s", chat_id, resp.status_code, resp.text[:200])
-            return False
-        return True
-    except Exception as e:
-        log.warning("Error sending to %s: %s", chat_id, e)
-        return False
-
-
-def main():
-    if not BOT_TOKEN:
-        log.error("BOT_TOKEN is not set")
-        sys.exit(1)
-    if not OWNER_ID:
-        log.error("OWNER_ID is not set")
-        sys.exit(1)
-
-    message = "📢 Broadcast from bot" if len(sys.argv) < 2 else sys.argv[1]
-    log.info("Broadcasting to all PM users: %s", message)
-
-    users = get_users()
-    if not users:
-        log.warning("No PM users found in database.")
-        sys.exit(0)
-
-    # Always include the owner.
-    try:
-        owner = int(OWNER_ID)
-    except ValueError:
-        owner = None
-    if owner and owner not in users:
-        users.append(owner)
-
-    sent = 0
-    failed = 0
-    for uid in users:
-        ok = send_message(uid, message)
-        if ok:
-            sent += 1
+        if resp.status_code == 200:
+            success += 1
         else:
             failed += 1
-        # Respect Telegram rate limits (~30 msg/sec global, but be gentle).
+            if failed <= 3:
+                print(f"  Failed for {uid}: {resp.status_code} - {resp.text[:100]}")
         time.sleep(0.05)
+    except Exception as e:
+        failed += 1
+        if failed <= 3:
+            print(f"  Error for {uid}: {e}")
 
-    log.info("Done. Sent: %d, Failed: %d, Total: %d", sent, failed, len(users))
-
-
-if __name__ == "__main__":
-    main()
+print(f"Broadcast done: {success} ok, {failed} failed")
