@@ -271,6 +271,7 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC || 'JAI_HO' }}
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD || 'password' }}
           RUN_HOURS: ${{ github.event.inputs.hours || '5' }}
+        shell: bash {0}
         run: |
           HOURS=$(echo "${RUN_HOURS}" | bc -l 2>/dev/null || echo "5")
           SECONDS_TO_RUN=$(echo "$HOURS * 3600" | bc -l 2>/dev/null || echo "18000")
@@ -354,6 +355,7 @@ jobs:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
           AUTO_RESTART: ${{ github.event.inputs.auto_restart || 'true' }}
           GITHUB_REPO: ${{ github.repository }}
+        shell: bash {0}
         run: |
           AUTO_RESTART=$(echo "$AUTO_RESTART" | tr '[:upper:]' '[:lower:]')
 
