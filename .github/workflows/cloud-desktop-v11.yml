@@ -93,18 +93,30 @@ jobs:
 
           mkdir -p ~/.vnc
 
-          echo "${VNC_PASSWORD}" | tigervncpasswd -f > ~/.vnc/passwd
+          # Set VNC password with fallback chain: tigervncpasswd -> vncpasswd -> openssl
+          if command -v tigervncpasswd >/dev/null 2>&1; then
+            echo "${VNC_PASSWORD}" | tigervncpasswd -f > ~/.vnc/passwd
+          elif command -v vncpasswd >/dev/null 2>&1; then
+            echo "${VNC_PASSWORD}" | vncpasswd -f > ~/.vnc/passwd
+          else
+            # openssl fallback: TigerVNC expects an 8-byte (DES-encrypted) passwd file
+            printf '%s' "${VNC_PASSWORD}" | openssl enc -des -e -nosalt -pass pass:0123456789abcdef -out ~/.vnc/passwd 2>/dev/null || \
+              printf '%s' "${VNC_PASSWORD}" | head -c 8 > ~/.vnc/passwd
+          fi
           chmod 600 ~/.vnc/passwd
+
           if [ ! -s ~/.vnc/passwd ]; then
             echo "::error::Password file is empty or missing!"
             exit 1
           fi
 
+          # VNC config
           echo 'desktop=cloud-desktop' > ~/.vnc/config
           echo 'geometry='"${RESOLUTION}" >> ~/.vnc/config
           echo 'depth=16' >> ~/.vnc/config
           echo 'rfbport=5901' >> ~/.vnc/config
 
+          # xstartup
           printf '%s\n' \
             '#!/bin/bash' \
             'unset SESSION_MANAGER' \
@@ -121,15 +133,16 @@ jobs:
             'exec startxfce4' > ~/.vnc/xstartup
           chmod +x ~/.vnc/xstartup
 
-          vncserver :1 -AlwaysShared
+          vncserver :1 -AlwaysShared 2>&1
           sleep 3
 
-          if ! ps aux | grep [v]nc >/dev/null || ! ss -tlnp 2>/dev/null | grep 5901 >/dev/null; then
+          if ps aux | grep [v]nc >/dev/null && ss -tlnp 2>/dev/null | grep -q 5901; then
+            echo "SUCCESS: TigerVNC server running on :1 (port 5901)"
+          else
             echo "::error::TigerVNC failed to start"
             cat ~/.vnc/*:1.log 2>/dev/null || true
             exit 1
           fi
-          echo "SUCCESS: TigerVNC server running on :1 (port 5901)"
 
       - name: Start websockify
         run: |
@@ -230,6 +243,7 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC || 'JAI_HO' }}
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD || 'password' }}
           RUN_HOURS: ${{ github.event.inputs.hours || '5' }}
+        shell: bash {0}
         run: |
           HOURS=$(echo "${RUN_HOURS}" | bc -l 2>/dev/null || echo "5")
           SECONDS_TO_RUN=$(echo "$HOURS * 3600" | bc -l 2>/dev/null || echo "18000")
@@ -313,6 +327,7 @@ jobs:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
           AUTO_RESTART: ${{ github.event.inputs.auto_restart || 'true' }}
           GITHUB_REPO: ${{ github.repository }}
+        shell: bash {0}
         run: |
           AUTO_RESTART=$(echo "$AUTO_RESTART" | tr '[:upper:]' '[:lower:]')
 
